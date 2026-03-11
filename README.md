@@ -1,4 +1,4 @@
-# autoresearch-macos
+# autoresearch
 
 ![teaser](progress.png)
 
