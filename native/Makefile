@@ -67,12 +67,24 @@ build/test_dynamic_matmul: probes/test_dynamic_matmul.m
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 # === Dynamic training ===
-.PHONY: train
+.PHONY: train train-overnight
 train: build/train_dynamic
+train-overnight: build/train_overnight_nl4_s256
 
 build/train_dynamic: training/train.m mil/mil_dynamic.h training/cpu_ops.h runtime/config.h runtime/io.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ training/train.m $(LDFLAGS)
+
+# Overnight config: 6 layers, SEQ=512 (67.6M params, ~99ms/step)
+build/train_overnight_nl6_s512: training/train.m mil/mil_dynamic.h training/cpu_ops.h runtime/config.h runtime/io.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INCLUDES) -DNLAYERS=6 -DSEQ=512 -o $@ training/train.m $(LDFLAGS)
+
+
+build/train_overnight_nl4_s256: training/train.m mil/mil_dynamic.h training/cpu_ops.h runtime/config.h runtime/io.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INCLUDES) -DNLAYERS=4 -DSEQ=256 -o $@ training/train.m $(LDFLAGS)
+
 
 # === All targets ===
 .PHONY: all

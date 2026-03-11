@@ -21,3 +21,9 @@ dev/
 
 # Results file
 results.tsv
+
+# Data files
+native/data/
+data/
+*.bin
+*.log

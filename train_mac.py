@@ -534,7 +534,9 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # DEPTH=16 → ~200M params (comfortable on 128GB)
 # DEPTH=24 → ~450M params (uses ~30GB, fine on 128GB)
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 64   # reduced vs CUDA (MPS is slower per-op but has more memory)
+# Reduce batch size if OOM: 64→32 (~half memory), 32→16 (~1/4 memory).
+# Gradient accumulation keeps effective batch size at TOTAL_BATCH_SIZE.
+DEVICE_BATCH_SIZE = 32   # 64 can OOM on 64GB Mac; use 16 if still OOM
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader

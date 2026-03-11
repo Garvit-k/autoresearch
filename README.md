@@ -32,6 +32,7 @@ Same protocol: an AI agent modifies training code, runs 5-minute experiments, ev
 cd native && make all
 make test-ane              # verify ANE hardware access
 make bench-sram            # probe SRAM performance cliffs
+make train-overnight       # build 6-layer SEQ=512 config (67.6M params)
 ./build/train_overnight_nl6_s512 --steps 10000 --scratch --lr 2e-4 \
   --data data/train.bin --val data/val.bin
 ```

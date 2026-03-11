@@ -14,6 +14,7 @@ This project has two layers:
 ## Quick Start
 
 ### Training (works now)
+
 ```bash
 cp pyproject_mac.toml pyproject.toml && uv sync
 uv run prepare.py --num-shards 8
@@ -21,6 +22,7 @@ uv run train_mac.py
 ```
 
 ### ANE Research (requires macOS on Apple Silicon)
+
 ```bash
 # Build everything
 cd native && make all
@@ -42,12 +44,14 @@ cd .. && python ane_benchmark.py --all
 
 ### Training: MPS Backend (`train_mac.py`)
 
-| Feature | CUDA (Original) | Mac Silicon (This Fork) |
-|---------|-----------------|------------------------|
-| GPU | NVIDIA H100 | Apple Silicon GPU (MPS) |
-| Attention | Flash Attention 3 | PyTorch native SDPA |
-| Precision | bfloat16 | float16 |
-| Memory | 80GB VRAM | Up to 192GB unified |
+
+| Feature   | CUDA (Original)   | Mac Silicon (This Fork) |
+| --------- | ----------------- | ----------------------- |
+| GPU       | NVIDIA H100       | Apple Silicon GPU (MPS) |
+| Attention | Flash Attention 3 | PyTorch native SDPA     |
+| Precision | bfloat16          | float16                 |
+| Memory    | 80GB VRAM         | Up to 192GB unified     |
+
 
 ### ANE Research: Native Code (`native/`)
 
@@ -55,7 +59,7 @@ The `native/` directory contains ported and adapted code from [maderix/ANE](http
 
 #### Key Breakthrough: Dynamic Weights
 
-The original maderix/ANE project achieved only 5-9% ANE utilization because weights were baked into compiled kernels. Every optimizer step required recompiling ~60 kernels (~3.7s overhead).
+The original maderix/ANE project achieved only 5-9% ANE utilization because weights were baked into compiled kernels. Every optimizer step required recompiling ~~60 kernels (~~3.7s overhead).
 
 The `training_dynamic/` pipeline solves this: **weights are packed into the input IOSurface alongside activations**. Kernels compile ONCE at startup. Weight updates are just memcpy to shared memory.
 
@@ -146,30 +150,35 @@ This project continues the research started by maderix/ANE:
 
 ## Apple Silicon Compute Units
 
-| Unit | Peak (M4 Max) | Used For (Currently) | Potential |
-|------|---------------|---------------------|-----------|
-| **ANE** | 38 TOPS | CoreML inference only | Training (proven by maderix/ANE) |
-| **GPU** | 15.2 TFLOPS | MPS training | Could pipeline with ANE |
-| **CPU** | P+E cores | Everything else | Accelerate/vDSP for element-wise |
-| **AMX** | ~2 TFLOPS | BLAS calls | Matrix operations without GPU |
+
+| Unit    | Peak (M4 Max) | Used For (Currently)  | Potential                        |
+| ------- | ------------- | --------------------- | -------------------------------- |
+| **ANE** | 38 TOPS       | CoreML inference only | Training (proven by maderix/ANE) |
+| **GPU** | 15.2 TFLOPS   | MPS training          | Could pipeline with ANE          |
+| **CPU** | P+E cores     | Everything else       | Accelerate/vDSP for element-wise |
+| **AMX** | ~2 TFLOPS     | BLAS calls            | Matrix operations without GPU    |
+
 
 **The opportunity**: Today's ML frameworks use GPU only. With 128GB unified memory and 4 compute units sharing the same address space, Apple Silicon should be able to exceed GPU-only throughput.
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `train_mac.py` | PyTorch MPS training (production) |
-| `ane_bridge.py` | Python ctypes bridge to native ANE code |
-| `ane_benchmark.py` | Benchmark suite for all compute units |
-| `ane_inference.py` | CoreML inference on ANE |
-| `convert_to_coreml.py` | PyTorch → CoreML model conversion |
-| `native/` | Ported maderix/ANE Objective-C code |
-| `prepare.py` | Data preparation (read-only) |
-| `train.py` | Original CUDA training (upstream reference) |
+
+| File                   | Purpose                                     |
+| ---------------------- | ------------------------------------------- |
+| `train_mac.py`         | PyTorch MPS training (production)           |
+| `ane_bridge.py`        | Python ctypes bridge to native ANE code     |
+| `ane_benchmark.py`     | Benchmark suite for all compute units       |
+| `ane_inference.py`     | CoreML inference on ANE                     |
+| `convert_to_coreml.py` | PyTorch → CoreML model conversion           |
+| `native/`              | Ported maderix/ANE Objective-C code         |
+| `prepare.py`           | Data preparation (read-only)                |
+| `train.py`             | Original CUDA training (upstream reference) |
+
 
 ## Acknowledgments
 
 - [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — The autonomous research framework and climbmix-400b dataset
 - [maderix/ANE](https://github.com/maderix/ANE) — Pioneering reverse-engineering of ANE for training. The `native/` directory is ported from this project.
 - [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) — macOS fork with Metal/MPS support that bridged Karpathy's CUDA code to Apple Silicon
+
