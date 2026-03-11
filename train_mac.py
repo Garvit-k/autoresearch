@@ -1,31 +1,100 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Autoresearch pretraining script — Mac Silicon (MPS) edition.
+Adapted from train.py for Apple Silicon with unified memory.
+
+Replaces:
+  - CUDA device → MPS (Metal Performance Shaders)
+  - Flash Attention 3 → PyTorch native scaled_dot_product_attention
+  - torch.compile → optional (MPS support is evolving)
+  - H100 FLOPS reference → M-series estimated FLOPS
+
+Usage: python train_mac.py
+       (or: uv run train_mac.py)
+
+Your 128GB unified memory means you can run much larger models than
+typical GPU-bound setups — the model and data share the same memory pool.
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
 import gc
+import sys
 import time
+import platform
 from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
-# GPT Model
+# Device setup
+# ---------------------------------------------------------------------------
+
+if not (sys.platform == "darwin" and platform.machine() == "arm64"):
+    print("WARNING: This script is designed for Apple Silicon Macs.")
+    print("For NVIDIA GPUs, use train.py instead.")
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print(f"Using MPS (Metal Performance Shaders) on {platform.processor()}")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("MPS not available, falling back to CUDA")
+else:
+    device = torch.device("cpu")
+    print("WARNING: No GPU backend available, using CPU (will be very slow)")
+
+# Estimate Apple Silicon FLOPS for MFU calculation
+# These are approximate fp16/bf16 peak TFLOPS for the GPU portion
+# The Neural Engine adds additional TOPS but isn't used by MPS directly
+APPLE_SILICON_FLOPS = {
+    "M1":        2.6e12,
+    "M1 Pro":    5.2e12,
+    "M1 Max":   10.4e12,
+    "M1 Ultra": 20.8e12,
+    "M2":        3.6e12,
+    "M2 Pro":    6.8e12,
+    "M2 Max":   13.6e12,
+    "M2 Ultra": 27.2e12,
+    "M3":        3.6e12,
+    "M3 Pro":    7.0e12,
+    "M3 Max":   14.2e12,
+    "M3 Ultra": 28.4e12,
+    "M4":        3.8e12,
+    "M4 Pro":    7.6e12,
+    "M4 Max":   15.2e12,
+    "M4 Ultra": 30.4e12,
+}
+
+def detect_chip():
+    """Try to detect which Apple Silicon chip is in use."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, timeout=5
+        )
+        brand = result.stdout.strip()
+        # Try matching from most specific to least
+        for chip_name in sorted(APPLE_SILICON_FLOPS.keys(), key=len, reverse=True):
+            if chip_name.replace(" ", "") in brand.replace(" ", ""):
+                return chip_name
+    except Exception:
+        pass
+    return None
+
+chip = detect_chip()
+if chip:
+    PEAK_FLOPS = APPLE_SILICON_FLOPS[chip]
+    print(f"Detected: Apple {chip} — estimated {PEAK_FLOPS/1e12:.1f} TFLOPS peak (GPU)")
+else:
+    PEAK_FLOPS = 14.2e12  # default to M3 Max as reasonable middle ground
+    print(f"Could not detect chip, assuming {PEAK_FLOPS/1e12:.1f} TFLOPS peak")
+
+# ---------------------------------------------------------------------------
+# GPT Model (Flash Attention → native SDPA)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -89,8 +158,22 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        # Transpose to (B, n_heads, T, head_dim) for SDPA
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Expand KV heads for GQA if needed
+        if self.n_kv_head < self.n_head:
+            repeat_factor = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+
+        # Use PyTorch's native scaled_dot_product_attention
+        # This uses efficient attention backends available on MPS
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -166,7 +249,7 @@ class GPT(nn.Module):
         # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        # Gate weights init to zero
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
@@ -174,20 +257,22 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        # Cast embeddings to float16 (MPS supports float16, limited bfloat16)
+        embed_dtype = torch.float16 if device.type == "mps" else torch.bfloat16
+        self.transformer.wte.to(dtype=embed_dtype)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.to(dtype=embed_dtype)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device_override=None):
+        target_device = device_override or self.transformer.wte.weight.device
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=target_device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        t = torch.arange(seq_len, dtype=torch.float32, device=target_device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        # MPS has limited bfloat16 support — use float16 on MPS
+        target_dtype = torch.float16 if str(target_device).startswith("mps") else torch.bfloat16
+        cos, sin = cos.to(target_dtype), sin.to(target_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -290,7 +375,7 @@ class GPT(nn.Module):
         return logits
 
 # ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
+# Optimizer (MuonAdamW — adapted for MPS, no torch.compile)
 # ---------------------------------------------------------------------------
 
 polar_express_coeffs = [
@@ -301,7 +386,8 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+# On MPS, torch.compile support is limited. Use eager mode.
+# When PyTorch MPS compilation matures, these can be wrapped with @torch.compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -312,15 +398,14 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
+    # Polar express orthogonalization — use float32 on MPS for stability
+    X = g.float()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -332,7 +417,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    g = X
+    g = X.to(stacked_grads.dtype)
     # NorMuon variance reduction
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
@@ -357,7 +442,6 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -397,12 +481,12 @@ class MuonAdamW(torch.optim.Optimizer):
         p = params[0]
         state = self.state[p]
         num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
+        shape, p_device, dtype = p.shape, p.device, p.dtype
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=p_device)
         if "second_momentum_buffer" not in state:
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=p_device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
@@ -445,9 +529,12 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
+# Model size — with 128GB unified memory, you can go bigger!
+# DEPTH=8 → ~50M params (default, fits any Mac)
+# DEPTH=16 → ~200M params (comfortable on 128GB)
+# DEPTH=24 → ~450M params (uses ~30GB, fine on 128GB)
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64   # reduced vs CUDA (MPS is slower per-op but has more memory)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -455,11 +542,22 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+if device.type == "mps":
+    torch.mps.manual_seed(42)
+elif device.type == "cuda":
+    torch.cuda.manual_seed(42)
+
+# MPS supports float16 well; float32 matmul precision setting is CUDA-only
+if device.type == "cuda":
+    torch.set_float32_matmul_precision("high")
+
+# MPS uses float16 instead of bfloat16
+if device.type == "mps":
+    autocast_ctx = torch.amp.autocast(device_type="mps", dtype=torch.float16)
+elif device.type == "cuda":
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+else:
+    autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -478,9 +576,10 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
+# On MPS, we can't use the meta device trick the same way
+# But with 128GB unified memory, direct allocation is fine
+model = GPT(config)
+model.to(device)
 model.init_weights()
 
 param_counts = model.num_scaling_params()
@@ -490,6 +589,7 @@ for key, value in param_counts.items():
 num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+print(f"Model memory: ~{num_params * 2 / 1024**3:.2f} GB (float16)")
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
@@ -504,13 +604,25 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+# torch.compile on MPS — try it, fall back to eager if it fails
+USE_COMPILE = os.environ.get("AUTORESEARCH_COMPILE", "0") == "1"
+if USE_COMPILE:
+    try:
+        model = torch.compile(model, dynamic=False)
+        print("torch.compile enabled")
+    except Exception as e:
+        print(f"torch.compile not available on this backend: {e}")
+        print("Running in eager mode (this is normal for MPS)")
+else:
+    print("Running in eager mode (set AUTORESEARCH_COMPILE=1 to try torch.compile)")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Effective batch size: {TOTAL_BATCH_SIZE:,} tokens")
+print(f"Unified memory advantage: model + optimizer + data all share {128 if chip and 'Ultra' in chip else 'your'}GB pool")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -539,8 +651,17 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
+# Helper for device synchronization
+def sync_device():
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+print("\n--- Training started ---")
+
 while True:
-    torch.cuda.synchronize()
+    sync_device()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -570,7 +691,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    sync_device()
     t1 = time.time()
     dt = t1 - t0
 
@@ -583,12 +704,22 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    # Memory tracking
+    if device.type == "mps":
+        mem_mb = torch.mps.current_allocated_memory() / 1024 / 1024
+        mem_str = f"mem: {mem_mb:.0f}MB"
+    elif device.type == "cuda":
+        mem_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+        mem_str = f"vram: {mem_mb:.0f}MB"
+    else:
+        mem_str = ""
 
-    # GC management (Python's GC causes ~500ms stalls)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | {mem_str} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+    # GC management
     if step == 0:
         gc.collect()
         gc.freeze()
@@ -614,16 +745,35 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_FLOPS if total_training_time > 0 else 0
+
+if device.type == "mps":
+    peak_mem_mb = torch.mps.driver_allocated_memory() / 1024 / 1024
+elif device.type == "cuda":
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+else:
+    peak_mem_mb = 0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+print(f"peak_memory_mb:   {peak_mem_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"device:           {device}")
+if chip:
+    print(f"chip:             Apple {chip}")
+
+# Save checkpoint for ANE conversion
+ckpt_path = "checkpoint_mac.pt"
+torch.save({
+    "model_state_dict": model.state_dict(),
+    "config": asdict(config),
+    "val_bpb": val_bpb,
+    "step": step,
+}, ckpt_path)
+print(f"Checkpoint saved to {ckpt_path} (use convert_to_coreml.py for ANE inference)")
